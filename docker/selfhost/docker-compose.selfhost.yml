@@ -95,6 +95,13 @@ services:
       context: ../..
       dockerfile: docker/Dockerfile
       target: server
+      # 构建期依赖源。留空 = 用官方源（deb.debian.org / pypi.org / registry.yarnpkg.com）。
+      # 国内网络直连这些源常常慢到病态、甚至完全不通，构建会卡在 apt-get update。
+      # 在 .env 里指定镜像即可，取值见 .env.example。
+      args:
+        APT_MIRROR: ${APT_MIRROR:-}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+        YARN_REGISTRY: ${YARN_REGISTRY:-}
     restart: unless-stopped
     depends_on:
       migrate-next:
