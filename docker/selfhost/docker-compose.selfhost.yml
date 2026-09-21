@@ -1,0 +1,158 @@
+# =============================================================================
+# Agents Anywhere · 自托管编排（N100 + Tailscale + 阿里云 Nginx 形态）
+#
+# 本文件派生自 docker/docker-compose.postgres.yml，四处有意为之的差异：
+#
+#   1. Web 端口只绑定 AGENTS_ANYWHERE_BIND_ADDR（默认 127.0.0.1），不再绑定
+#      0.0.0.0。上游那份会把 5174 暴露给整个局域网，自托管场景下没必要。
+#   2. 加入日志轮转和容器资源上限，适配 N100 这类低功耗小主机长期运行。
+#   3. 为 server-next 增加 /api/v2/health/ready 健康检查，供脚本和外部探活。
+#   4. 关键变量用 ${VAR:?} 强制必填，避免带着默认弱密码直接跑起来。
+#
+# 服务名、项目名（agents-anywhere）和数据卷名都与上游保持一致，
+# 因此两种编排共用同一份数据卷，可以随时切换而无需迁移数据。
+#
+# 请通过同目录的 ./aa.sh 调用，不要直接 docker compose up：
+#   ./aa.sh up        构建并启动全套
+#   ./aa.sh logs      跟随日志
+#   ./aa.sh down      停止（保留数据）
+# =============================================================================
+
+name: agents-anywhere
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  postgres-next:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: agents_anywhere
+      POSTGRES_USER: agents_anywhere
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in docker/selfhost/.env}
+    volumes:
+      - agents-anywhere-pg-next:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agents_anywhere -d agents_anywhere"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    mem_limit: ${POSTGRES_MEM_LIMIT:-1g}
+    logging: *default-logging
+
+  redis-next:
+    image: redis:8-alpine
+    restart: unless-stopped
+    # Redis 承载跨实例协调、Pub/Sub 和 Timeline 定序器写缓冲。
+    # 待刷盘的 Timeline 键没有 TTL，因此这里用 noeviction + AOF everysec，
+    # 并挂持久卷；被驱逐的键会成为不可恢复的数据丢失。
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:-256mb}
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      - agents-anywhere-redis-next:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    mem_limit: ${REDIS_MEM_LIMIT:-512m}
+    logging: *default-logging
+
+  # 一次性迁移容器。每次 up 都会执行，已是最新版本时是空操作。
+  # 迁移通过 PostgreSQL 会话级 advisory lock 串行化。
+  migrate-next:
+    image: agents-anywhere-server:selfhost
+    depends_on:
+      postgres-next:
+        condition: service_healthy
+    environment:
+      AGENT_SERVER_DB_BACKEND: postgres
+      AGENT_SERVER_DB_URL: postgresql+asyncpg://agents_anywhere:${POSTGRES_PASSWORD:?}@postgres-next:5432/agents_anywhere
+      AGENT_SERVER_MIGRATION_LOCK_TIMEOUT: ${AGENT_SERVER_MIGRATION_LOCK_TIMEOUT:-120}
+    command: ["sh", "-c", "cd /app/server && uv run --no-sync python -m agent_server.infra.db.migrations upgrade"]
+    restart: "no"
+    logging: *default-logging
+
+  server-next:
+    image: agents-anywhere-server:selfhost
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile
+      target: server
+    restart: unless-stopped
+    depends_on:
+      migrate-next:
+        condition: service_completed_successfully
+      redis-next:
+        condition: service_healthy
+    environment:
+      AGENT_SERVER_DB_BACKEND: postgres
+      AGENT_SERVER_DB_URL: postgresql+asyncpg://agents_anywhere:${POSTGRES_PASSWORD:?}@postgres-next:5432/agents_anywhere
+      AGENT_SERVER_DB_POOL_SIZE: ${AGENT_SERVER_DB_POOL_SIZE:-10}
+      AGENT_SERVER_DB_MAX_OVERFLOW: ${AGENT_SERVER_DB_MAX_OVERFLOW:-20}
+      AGENT_SERVER_DB_POOL_TIMEOUT: ${AGENT_SERVER_DB_POOL_TIMEOUT:-30}
+      AGENT_SERVER_DB_POOL_RECYCLE: ${AGENT_SERVER_DB_POOL_RECYCLE:-1800}
+      AGENT_SERVER_REDIS_URL: redis://redis-next:6379/0
+      AGENT_SERVER_REDIS_CONNECT_TIMEOUT: ${AGENT_SERVER_REDIS_CONNECT_TIMEOUT:-5}
+      AGENT_SERVER_TIMELINE_REVISION_LEASE_SIZE: ${AGENT_SERVER_TIMELINE_REVISION_LEASE_SIZE:-4096}
+      AGENT_SERVER_WORKERS: ${AGENT_SERVER_WORKERS:-1}
+      AGENT_SERVER_EVENT_WORKERS: ${AGENT_SERVER_EVENT_WORKERS:-2}
+      AGENT_SERVER_SETUP_TOKEN_TTL: ${AGENT_SERVER_SETUP_TOKEN_TTL:-900}
+      # 附件默认落本地卷 /data。改用 S3 时覆盖这三项即可（见 .env.example）。
+      AGENT_SERVER_FILES_BACKEND: ${AGENT_SERVER_FILES_BACKEND:-local}
+      AGENT_SERVER_FILES_LOCAL_ROOT: /data/agent-server.files
+      AGENT_SERVER_FILES_S3_BUCKET: ${AGENT_SERVER_FILES_S3_BUCKET:-}
+      AGENT_SERVER_FILES_S3_PREFIX: ${AGENT_SERVER_FILES_S3_PREFIX:-}
+      AGENT_SERVER_FILES_S3_ACCESS_KEY: ${AGENT_SERVER_FILES_S3_ACCESS_KEY:-}
+      AGENT_SERVER_FILES_S3_SECRET_KEY: ${AGENT_SERVER_FILES_S3_SECRET_KEY:-}
+      AGENT_SERVER_FILES_S3_REGION: ${AGENT_SERVER_FILES_S3_REGION:-}
+      AGENT_SERVER_FILES_S3_ENDPOINT_URL: ${AGENT_SERVER_FILES_S3_ENDPOINT_URL:-}
+      AGENT_SERVER_FILES_S3_VIRTUAL_HOST_STYLE: ${AGENT_SERVER_FILES_S3_VIRTUAL_HOST_STYLE:-true}
+      AGENT_SERVER_SECRET: ${AGENT_SERVER_SECRET:?set AGENT_SERVER_SECRET in docker/selfhost/.env}
+      # 服务端用这两个值拼接绝对 URL（OAuth 回调、分享链接、Cookie 判定）。
+      # 反向代理必须转发 X-Forwarded-Proto / X-Forwarded-Host，否则这里会被
+      # 当成 http 内网地址，登录会跳回登录页。
+      AGENT_SERVER_PUBLIC_ORIGIN: ${AGENT_SERVER_PUBLIC_ORIGIN:?set AGENT_SERVER_PUBLIC_ORIGIN in docker/selfhost/.env}
+      AGENT_SERVER_CORS_ORIGINS: ${AGENT_SERVER_CORS_ORIGINS:-${AGENT_SERVER_PUBLIC_ORIGIN}}
+    volumes:
+      - agents-anywhere-files-next:/data
+    ports:
+      # 只绑 Tailscale IP（或 127.0.0.1），不要把 5174 开到 0.0.0.0。
+      # 故意用 :? 强制显式填写：留空会静默退回 127.0.0.1，本机看着一切正常，
+      # 但阿里云的 Nginx 会连接被拒，排查起来很绕。
+      - "${AGENTS_ANYWHERE_BIND_ADDR:?set AGENTS_ANYWHERE_BIND_ADDR in docker/selfhost/.env}:${AGENTS_ANYWHERE_WEB_PORT:-5174}:8000"
+    stop_grace_period: 60s
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v2/health/ready', timeout=5)"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    mem_limit: ${SERVER_MEM_LIMIT:-3g}
+    cpus: ${SERVER_CPUS:-3.0}
+    logging: *default-logging
+
+volumes:
+  agents-anywhere-pg-next:
+  agents-anywhere-redis-next:
+  agents-anywhere-files-next:
