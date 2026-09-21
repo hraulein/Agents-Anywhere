@@ -86,7 +86,10 @@ local_host() {
 public_origin() { env_get AGENT_SERVER_PUBLIC_ORIGIN ""; }
 
 dc() {
-  docker compose --no-color --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" "$@"
+  # 不要加 --no-color：docker compose 没有这个全局参数（那是 docker logs 的），
+  # 会直接报 "unknown flag: --no-color"。默认的 --ansi auto 在终端里带颜色，
+  # 非 TTY 环境会自动去掉，正合适。
+  docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" "$@"
 }
 
 http_status() {
