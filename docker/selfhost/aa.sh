@@ -3,7 +3,9 @@
 # Agents Anywhere · 自托管运维脚本（在 N100 上以 root / docker 组用户执行）
 #
 #   ./aa.sh init        生成 .env（随机密钥 + 自动探测 Tailscale IP）
-#   ./aa.sh up          构建镜像并启动全套，等待就绪
+#   ./aa.sh up          启动全套（镜像不存在时才构建，等待就绪）
+#   ./aa.sh up --rebuild  强制重建镜像后再启动
+#   ./aa.sh build       构建镜像（已存在则跳过，--force 强制重建）
 #   ./aa.sh down        停止（保留数据卷）
 #   ./aa.sh restart     重启 server-next
 #   ./aa.sh ps          查看各服务状态
@@ -28,6 +30,7 @@ ROOT_DIR="$(cd "${SELFHOST_DIR}/../.." && pwd)"
 COMPOSE_FILE="${SELFHOST_DIR}/docker-compose.selfhost.yml"
 ENV_FILE="${AA_ENV_FILE:-${SELFHOST_DIR}/.env}"
 BACKUP_DIR="${SELFHOST_DIR}/backups"
+SERVER_IMAGE="agents-anywhere-server:selfhost"
 
 RESET=""; RED=""; GREEN=""; YELLOW=""; CYAN=""
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
@@ -93,14 +96,16 @@ dc() {
 }
 
 http_status() {
-  local url="$1"
+  local url="$1" code=""
   if command -v curl >/dev/null 2>&1; then
-    curl -s -o /dev/null -w '%{http_code}' --max-time 8 "${url}" || printf '000'
+    # curl 在连接失败时 -w 本身就会输出 000，所以这里只取它的输出，
+    # 不要再加 `|| printf '000'`，否则会得到 "000000"。
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "${url}" 2>/dev/null || true)"
   elif command -v wget >/dev/null 2>&1; then
-    wget -q -O /dev/null --timeout=8 "${url}" && printf '200' || printf '000'
-  else
-    printf 'n/a'
+    if wget -q -O /dev/null --timeout=8 "${url}" 2>/dev/null; then code="200"; else code="000"; fi
   fi
+  [[ -n "${code}" ]] || code="000"
+  printf '%s' "${code}"
 }
 
 # -----------------------------------------------------------------------------
@@ -192,6 +197,9 @@ cmd_init() {
   grep -q "^AGENTS_ANYWHERE_BIND_ADDR=${bind}$" "${tmp}"  || { rm -f "${tmp}"; fail "写入 AGENTS_ANYWHERE_BIND_ADDR 失败"; }
 
   mv "${tmp}" "${ENV_FILE}"
+  # mv 在同一文件系统上保留模式，但 --force 覆盖已有文件、以及某些平台上的
+  # chmod 语义差异都可能让它变成 644。这里再确认一次，里面是明文密钥。
+  chmod 600 "${ENV_FILE}" 2>/dev/null || warn "无法把 ${ENV_FILE} 设为 600，请手工执行 chmod 600"
 
   ok "已生成 ${ENV_FILE}（权限 600）"
   printf '\n'
@@ -212,11 +220,36 @@ cmd_init() {
   printf '  密钥都已落盘，建议现在备份一份 ${ENV_FILE} 到 N100 之外。\n'
   printf '  下一步：./aa.sh up\n\n'
 }
+image_exists() {
+  docker image inspect "${SERVER_IMAGE}" >/dev/null 2>&1
+}
+
 cmd_build() {
   require_env_file; require_docker
-  info "构建 server 镜像（首次构建 web-next 静态站点，可能需要 5-15 分钟）"
-  dc build server-next
-  ok "镜像构建完成：agents-anywhere-server:selfhost"
+
+  local force=false
+  [[ "${1:-}" == "--force" ]] && force=true
+
+  if image_exists && [[ "${force}" != true ]]; then
+    ok "镜像 ${SERVER_IMAGE} 已存在，跳过构建"
+    printf '    强制重建：./aa.sh build --force\n'
+    return 0
+  fi
+
+  info "构建 server 镜像（首次构建要编译 web-next 静态站点，视网络 15-35 分钟）"
+  if ! dc build server-next; then
+    fail "构建失败。按下面顺序排查：
+     1) 日志出现 failed to fetch anonymous token / EOF
+        → Docker Hub 鉴权端点不通。先试：docker buildx use default
+          （daemon.json 里的 registry-mirrors 只对 docker pull 生效，
+            独立的 buildx 构建器读不到它）
+          仍不行就在别的机器构建，然后 docker save | ssh | docker load 过来。
+     2) 卡在 apt / pip / yarn 很久
+        → 在 .env 里配 APT_MIRROR / PIP_INDEX_URL / YARN_REGISTRY，见 .env.example
+     3) 进程被 OOM 杀掉
+        → docker stats --no-stream 看内存水位，或先停掉不用的服务"
+  fi
+  ok "镜像构建完成：${SERVER_IMAGE}"
 }
 
 wait_ready() {
@@ -238,7 +271,16 @@ wait_ready() {
 
 cmd_up() {
   require_env_file; require_docker
-  cmd_build
+
+  local rebuild=false
+  [[ "${1:-}" == "--rebuild" ]] && rebuild=true
+
+  if [[ "${rebuild}" == true ]] || ! image_exists; then
+    cmd_build --force
+  else
+    info "镜像 ${SERVER_IMAGE} 已存在，跳过构建（要重建：./aa.sh up --rebuild）"
+  fi
+
   info "启动 postgres / redis / migrate / server"
   dc up -d
   # 首次启动要跑完迁移，低功耗机器上给足时间。
