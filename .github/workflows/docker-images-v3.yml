@@ -2,12 +2,11 @@
 #
 # The fork only carries this workflow and `docker/v3/compose.images.yml`; every build checks out the
 # *upstream* commit and leaves this fork's `main` alone. Images are rebuilt when upstream `main` moves
-# (or on demand). A commit that is already published as `v3-sha-<12>` is skipped; if only a legacy
-# `sha-<12>` tag exists (from before the `v3-` prefix), the same manifest is re-tagged instead of rebuilt.
+# (or on demand), and a commit that is already published as `sha-<12>` is skipped.
 #
-# Tag scheme (v3): `v3-latest`, `v3-sha-<12>`, `v3-date-<YYYYMMDD>`.
-# Old un-prefixed tags (`latest`, `sha-<12>`, `date-<...>`) are frozen and only kept so deployments that
-# still pin them keep working.
+# Tag scheme (all four AA repos use the same scheme; each version has its own repository):
+#   `latest`, `sha-<12>`, `date-<YYYYMMDD>`
+# `latest` follows upstream `main`; pin `sha-<12>` when reproducibility matters.
 #
 # Required repository secrets: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN (read & write).
 # Optional: GOTIFY_SERVER, GOTIFY_TOKEN for build notifications.
@@ -25,7 +24,7 @@ on:
         required: false
         default: ""
       force:
-        description: "Rebuild even when v3-sha-<commit> is already on Docker Hub"
+        description: "Rebuild even when sha-<commit> is already on Docker Hub"
         type: boolean
         default: false
 
@@ -40,7 +39,6 @@ env:
   UPSTREAM_REPO: anywhere-labs/Agents-Anywhere
   UPSTREAM_BRANCH: main
   IMAGE_NAMESPACE: hraulein
-  TAG_PREFIX: v3
   KEEP_SHA_TAGS: "20"
   KEEP_DATE_TAGS: "30"
 
@@ -110,32 +108,25 @@ jobs:
         run: |
           set -euo pipefail
           image="${IMAGE_NAMESPACE}/agents-anywhere-${{ matrix.name }}"
-          short="${{ needs.resolve.outputs.short }}"
-          force="${{ inputs.force }}"
-          code_new=$(curl -s -o /dev/null -w '%{http_code}' \
-            "https://hub.docker.com/v2/repositories/${image}/tags/${TAG_PREFIX}-sha-${short}")
-          code_legacy=$(curl -s -o /dev/null -w '%{http_code}' \
-            "https://hub.docker.com/v2/repositories/${image}/tags/sha-${short}")
-
-          if [ "$code_new" = "200" ] && [ "$force" != "true" ]; then
-            echo "mode=skip" >> "$GITHUB_OUTPUT"
-            echo "${image}:${TAG_PREFIX}-sha-${short} already exists; skipping."
-          elif [ "$code_legacy" = "200" ] && [ "$force" != "true" ]; then
-            echo "mode=retag" >> "$GITHUB_OUTPUT"
-            echo "${image}:sha-${short} exists but ${TAG_PREFIX}-sha-${short} does not; re-tagging without a rebuild."
+          tag="sha-${{ needs.resolve.outputs.short }}"
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://hub.docker.com/v2/repositories/${image}/tags/${tag}")
+          if [ "$code" = "200" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "${image}:${tag} already exists; skipping."
           else
-            echo "mode=build" >> "$GITHUB_OUTPUT"
-            echo "No published image for ${short} (new=${code_new}, legacy=${code_legacy}); building."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "${image}:${tag} not published yet (HTTP $code); building."
           fi
 
       - name: Checkout
-        if: steps.published.outputs.mode == 'build'
+        if: steps.published.outputs.build == 'true'
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
       - name: Check out upstream commit
-        if: steps.published.outputs.mode == 'build'
+        if: steps.published.outputs.build == 'true'
         env:
           SHA: ${{ needs.resolve.outputs.sha }}
         run: |
@@ -149,53 +140,38 @@ jobs:
           git log -1 --format='%H %s'
 
       - name: Set up QEMU
-        if: steps.published.outputs.mode == 'build'
+        if: steps.published.outputs.build == 'true'
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Buildx
-        if: steps.published.outputs.mode != 'skip'
+        if: steps.published.outputs.build == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Login to Docker Hub
-        if: steps.published.outputs.mode != 'skip'
+        if: steps.published.outputs.build == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Re-tag the existing manifest (no rebuild)
-        if: steps.published.outputs.mode == 'retag'
-        run: |
-          set -euo pipefail
-          image="${IMAGE_NAMESPACE}/agents-anywhere-${{ matrix.name }}"
-          short="${{ needs.resolve.outputs.short }}"
-          args=(
-            -t "${image}:${TAG_PREFIX}-sha-${short}"
-            -t "${image}:${TAG_PREFIX}-date-${{ needs.resolve.outputs.date }}"
-          )
-          if [ "${{ needs.resolve.outputs.is_main }}" = "true" ]; then
-            args+=(-t "${image}:${TAG_PREFIX}-latest")
-          fi
-          docker buildx imagetools create "${args[@]}" "${image}:sha-${short}"
-
       - name: Compose the tag list
         id: tags
-        if: steps.published.outputs.mode == 'build'
+        if: steps.published.outputs.build == 'true'
         run: |
           set -euo pipefail
           image="${IMAGE_NAMESPACE}/agents-anywhere-${{ matrix.name }}"
           {
             echo "tags<<EOF"
-            echo "${image}:${TAG_PREFIX}-sha-${{ needs.resolve.outputs.short }}"
-            echo "${image}:${TAG_PREFIX}-date-${{ needs.resolve.outputs.date }}"
+            echo "${image}:sha-${{ needs.resolve.outputs.short }}"
+            echo "${image}:date-${{ needs.resolve.outputs.date }}"
             if [ "${{ needs.resolve.outputs.is_main }}" = "true" ]; then
-              echo "${image}:${TAG_PREFIX}-latest"
+              echo "${image}:latest"
             fi
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
       - name: Build and push
-        if: steps.published.outputs.mode == 'build'
+        if: steps.published.outputs.build == 'true'
         uses: docker/build-push-action@v6
         with:
           context: ${{ matrix.context }}
@@ -206,13 +182,13 @@ jobs:
           labels: |
             org.opencontainers.image.source=https://github.com/${{ env.UPSTREAM_REPO }}
             org.opencontainers.image.revision=${{ needs.resolve.outputs.sha }}
-            org.opencontainers.image.version=${{ env.TAG_PREFIX }}-sha-${{ needs.resolve.outputs.short }}
+            org.opencontainers.image.version=sha-${{ needs.resolve.outputs.short }}
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}
           provenance: false
 
       - name: Prune old tags
-        if: steps.published.outputs.mode != 'skip'
+        if: steps.published.outputs.build == 'true'
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -225,7 +201,7 @@ jobs:
           prune() {
             local prefix="$1" keep="$2"
             local stale
-            stale=$(printf '%s' "$list" | jq -r --arg p "${TAG_PREFIX}-${prefix}-" --argjson k "$keep" \
+            stale=$(printf '%s' "$list" | jq -r --arg p "${prefix}-" --argjson k "$keep" \
               '[.results[] | select(.name | startswith($p))] | sort_by(.last_updated) | reverse | .[$k:] | .[].name')
             for t in $stale; do
               echo "prune ${image}:${t}"
@@ -261,8 +237,8 @@ jobs:
             title="AA v3 images: build ${RESULT} (${SHORT})"
             priority=8
           fi
-          body=$(printf 'result: %s\ncommit: %s\nimages: %s/agents-anywhere-{control,web,router}:%s-sha-%s\nrun: %s/%s/actions/runs/%s' \
-            "$RESULT" "$SHORT" "${IMAGE_NAMESPACE}" "${TAG_PREFIX}" "$SHORT" \
+          body=$(printf 'result: %s\ncommit: %s\nimages: %s/agents-anywhere-{control,web,router}:sha-%s\nrun: %s/%s/actions/runs/%s' \
+            "$RESULT" "$SHORT" "${IMAGE_NAMESPACE}" "$SHORT" \
             "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}")
           curl -fsS -X POST "${GOTIFY_SERVER%/}/message?token=${GOTIFY_TOKEN}" \
             -F "title=${title}" -F "message=${body}" -F "priority=${priority}" \

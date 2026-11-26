@@ -8,8 +8,8 @@
 # build. It needs Compose v2.24.4 or newer; on older Compose use the two commands above with
 # `--no-build` (and never plain `up`), or upgrade Compose.
 #
-# Pin a specific build with `AA_IMAGE_TAG`, e.g. `AA_IMAGE_TAG=v3-sha-1a2b3c4d5e6f` or
-# `AA_IMAGE_TAG=v3-date-20261126`. Without it both `pull` and `up` use `v3-latest`.
+# Pin a specific build with `AA_IMAGE_TAG`, e.g. `AA_IMAGE_TAG=sha-1a2b3c4d5e6f` or
+# `AA_IMAGE_TAG=date-20261126`. Without it both `pull` and `up` use `latest`.
 #
 # The web image bakes its `/api/control/*` rewrite target at build time (`AA_CONTROL_SERVER_URL`,
 # default `http://control:8080`). These published images expect this compose file's service names;
@@ -18,20 +18,20 @@
 services:
   router:
     build: !reset null
-    image: ${AA_IMAGE_NAMESPACE:-hraulein}/agents-anywhere-router:${AA_IMAGE_TAG:-v3-latest}
+    image: ${AA_IMAGE_NAMESPACE:-hraulein}/agents-anywhere-router:${AA_IMAGE_TAG:-latest}
 
   migrate:
     build: !reset null
-    image: ${AA_IMAGE_NAMESPACE:-hraulein}/agents-anywhere-control:${AA_IMAGE_TAG:-v3-latest}
+    image: ${AA_IMAGE_NAMESPACE:-hraulein}/agents-anywhere-control:${AA_IMAGE_TAG:-latest}
 
   control:
     build: !reset null
-    image: ${AA_IMAGE_NAMESPACE:-hraulein}/agents-anywhere-control:${AA_IMAGE_TAG:-v3-latest}
+    image: ${AA_IMAGE_NAMESPACE:-hraulein}/agents-anywhere-control:${AA_IMAGE_TAG:-latest}
 
   web:
     build: !reset null
-    image: ${AA_IMAGE_NAMESPACE:-hraulein}/agents-anywhere-web:${AA_IMAGE_TAG:-v3-latest}
+    image: ${AA_IMAGE_NAMESPACE:-hraulein}/agents-anywhere-web:${AA_IMAGE_TAG:-latest}
 
   s3-bucket:
     build: !reset null
-    image: ${AA_IMAGE_NAMESPACE:-hraulein}/agents-anywhere-control:${AA_IMAGE_TAG:-v3-latest}
+    image: ${AA_IMAGE_NAMESPACE:-hraulein}/agents-anywhere-control:${AA_IMAGE_TAG:-latest}

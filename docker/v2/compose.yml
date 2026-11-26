@@ -1,0 +1,94 @@
+# Agents Anywhere v2（一体化镜像：server + web-next 静态站）的最小 Compose。
+#
+# 镜像：hraulein/agents-anywhere-v2:latest（由 fork 的 "Docker Images v2" 工作流发布）
+# 端口：容器内 8000，宿主机默认 5175（V2_PORT）
+# 数据：./agents-anywhere-v2/{postgres,redis,files}
+#
+# 首次使用：
+#   cp .env.example .env        # 或在同级 .env 里设置 V2_POSTGRES_PASSWORD / V2_SERVER_SECRET
+#   docker compose -f docker/v2/compose.yml --project-directory . pull
+#   docker compose -f docker/v2/compose.yml --project-directory . up -d
+#   docker compose -f docker/v2/compose.yml --project-directory . logs v2-server | grep setup-token
+#
+# 首次管理员：server 会把一次性 setup-token 打到日志里（15 分钟有效，过期自动换新），
+# 在 Web 首次设置页粘贴它即可创建管理员。
+
+name: agents-anywhere-v2
+
+x-v2-env: &v2-env
+  AGENT_SERVER_DB_URL: postgresql+asyncpg://agents_anywhere:${V2_POSTGRES_PASSWORD:?set V2_POSTGRES_PASSWORD in .env}@v2-postgres:5432/agents_anywhere
+  AGENT_SERVER_REDIS_URL: redis://v2-redis:6379/0
+  AGENT_SERVER_SECRET: ${V2_SERVER_SECRET:?set V2_SERVER_SECRET in .env (>= 32 chars)}
+  AGENT_SERVER_FILES_BACKEND: local
+  AGENT_SERVER_FILES_LOCAL_ROOT: /data/agent-server.files
+  AGENT_SERVER_PUBLIC_ORIGIN: ${V2_PUBLIC_ORIGIN:-}
+  AGENT_SERVER_CORS_ORIGINS: ${V2_CORS_ORIGINS:-http://127.0.0.1:5175,http://localhost:5175}
+
+services:
+  v2-postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: agents_anywhere
+      POSTGRES_USER: agents_anywhere
+      POSTGRES_PASSWORD: ${V2_POSTGRES_PASSWORD:?set V2_POSTGRES_PASSWORD in .env}
+    volumes:
+      - ./agents-anywhere-v2/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agents_anywhere -d agents_anywhere"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  v2-redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - ${V2_REDIS_MAXMEMORY:-256mb}
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      - ./agents-anywhere-v2/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # 一次性迁移：与 server 同一个镜像，跑完退出（Exited 0 正常）。
+  v2-migrate:
+    image: hraulein/agents-anywhere-v2:${V2_IMAGE_TAG:-latest}
+    restart: "no"
+    depends_on:
+      v2-postgres:
+        condition: service_healthy
+    environment: *v2-env
+    command: ["sh", "-c", "cd /app/server && uv run --no-sync python -m agent_server.infra.db.migrations upgrade"]
+
+  v2-server:
+    image: hraulein/agents-anywhere-v2:${V2_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      v2-migrate:
+        condition: service_completed_successfully
+      v2-redis:
+        condition: service_healthy
+    environment: *v2-env
+    volumes:
+      - ./agents-anywhere-v2/files:/data
+    ports:
+      - "${V2_PORT:-5175}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v2/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s

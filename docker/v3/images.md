@@ -21,9 +21,9 @@
 
 | 镜像 | 来源 | 说明 |
 | --- | --- | --- |
-| `hraulein/agents-anywhere-v2` | `docker/Dockerfile` | v2 一体化镜像：`server/`（FastAPI）+ 构建后的 `web-next/` 静态站，监听 8000，数据卷 `/data` |
+| `hraulein/agents-anywhere-v2` | `docker/Dockerfile` | v2 一体化镜像：`server/`（FastAPI）+ 构建后的 `web-next/` 静态站，监听 8000，数据卷 `/data`；compose 模板见 [`docker/v2/compose.yml`](../v2/compose.yml) |
 
-v2 与 v3 用**不同仓库 + 不同 tag 前缀**区分：v2 全部是 `v2-*`，v3 全部是 `v3-*`。DSH 插件目前仍只支持 v2，
+v2 与 v3 用**不同仓库**区分，tag 规则完全一致（见下文），不用前缀也能分清。DSH 插件目前仍只支持 v2，
 所以两者要同时存在。v2 工作流只在 `server/`、`web-next/` 或 `docker/Dockerfile` 相对上一个 v2 构建有变化时才
 构建，纯 v3 的提交会被跳过。
 
@@ -33,20 +33,19 @@ v2 与 v3 用**不同仓库 + 不同 tag 前缀**区分：v2 全部是 `v2-*`，
 
 ## 标签
 
+四个仓库使用同一套 tag：
+
 | Tag | 含义 |
 | --- | --- |
-| `v3-sha-<12 位>` / `v2-sha-<12 位>` | 构建所用的上游 commit，唯一确定一次构建 |
-| `v3-date-YYYYMMDD` / `v2-date-YYYYMMDD` | 构建日期（UTC），同一天多次构建会互相覆盖，仅供人看 |
-| `v3-latest` / `v2-latest` | 对应版本在上游 `main` 的最新一次成功构建；手动构建历史 commit 或 tag 时不会更新 |
-
-旧的不带前缀的标签（`latest`、`sha-<12>`、`date-…`）从 v3 工作流改名起**冻结**，不再新增，只保留给
-还固定在这些 tag 上的部署（例如 `sha-65aa2214d340`）。新部署请用 `v3-…` / `v2-…`。
+| `sha-<12 位>` | 构建所用的上游 commit，唯一确定一次构建 |
+| `date-YYYYMMDD` | 构建日期（UTC），同一天多次构建会互相覆盖，仅供人看 |
+| `latest` | 上游 `main` 的最新一次成功构建；手动构建历史 commit 或 tag 时不会更新 |
 
 仓库没有提交 lockfile，`yarn install` / `uv sync` 每次都会重新解析依赖，所以同一个 commit 隔一段时间重建，
-内容可能不同。**要可复现就固定 `v3-sha-` / `v2-sha-` 标签**，不要用 `latest`。
+内容可能不同。**要可复现就固定 `sha-` 标签**，不要用 `latest`。
 
-两个工作流都会自动清理旧 tag：每个仓库保留最新 20 个 `*-sha-*` 和 30 个 `*-date-*`，其余删除
-（`*-latest` 不删）。这既控制 Docker Hub 的存储/配额，也避免 tag 列表无限增长。
+两个工作流都会自动清理旧 tag：每个仓库保留最新 20 个 `sha-*` 和 30 个 `date-*`，其余删除
+（`latest` 不删）。这既控制 Docker Hub 的存储/配额，也避免 tag 列表无限增长。
 
 ## 一次性准备：仓库 secrets
 
@@ -63,14 +62,12 @@ v2 与 v3 用**不同仓库 + 不同 tag 前缀**区分：v2 全部是 `v2-*`，
 
 ## 触发
 
-- **v3 定时**：每天 03:17（Asia/Shanghai）检查上游 `main`；commit 没变、且 `v3-sha-<12>` 已存在时跳过。
-  如果只有旧的 `sha-<12>`（改名前的 tag），会用 `docker buildx imagetools create` 直接补一个 `v3-sha-<12>`，
-  不重新构建。
+- **v3 定时**：每天 03:17（Asia/Shanghai）检查上游 `main`；commit 没变、且 `sha-<12>` 已存在时跳过。
 - **v2 定时**：每天 03:27 检查上游 `main`；只有当 `server/`、`web-next/` 或 `docker/Dockerfile` 相对上一个
   v2 构建有变化时才构建，纯 v3 提交不会触发。
 - **手动**：Actions → `Docker Images v3` 或 `Docker Images v2` → `Run workflow`。`ref` 留空表示上游 `main`，
   也可以填某个 tag、branch 或完整 sha；`force` 勾上则即使该 commit 已发布也重建。
-- 每个仓库的 `v3-latest` / `v2-latest` 只在构建的是上游 `main` 当前提交时才更新。
+- 每个仓库的 `latest` 只在构建的是上游 `main` 当前提交时才更新。
 
 ## 部署
 
