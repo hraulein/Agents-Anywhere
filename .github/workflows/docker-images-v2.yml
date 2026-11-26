@@ -1,0 +1,287 @@
+# Publish the AA v2 self-host image (FastAPI server + static web-next in one image) to Docker Hub.
+#
+# v2 lives next to v3 in the same upstream repo: the image is built from `docker/Dockerfile` at the
+# upstream commit, from this fork's default branch. The v3 services are published by
+# `docker-images-v3.yml`; this workflow only covers the legacy v2 bundle the DSH plugin still needs.
+#
+# Tag scheme (v2): `v2-latest`, `v2-sha-<12>`, `v2-date-<YYYYMMDD>` in `hraulein/agents-anywhere-v2`.
+# The repo is separate from the v3 images, and the `v2-` prefix keeps both tag families distinct.
+#
+# A commit is rebuilt only when something v2 actually ships changed: `server/`, `web-next/` or
+# `docker/Dockerfile` differ from the commit of the newest `v2-sha-*` tag. Pure v3 changes are skipped.
+#
+# Required repository secrets: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN (read & write).
+# Optional: GOTIFY_SERVER, GOTIFY_TOKEN for build notifications.
+
+name: Docker Images v2
+
+on:
+  schedule:
+    # 03:27 Asia/Shanghai every day (10 minutes after the v3 job).
+    - cron: "27 19 * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Upstream ref or commit SHA to build (empty = upstream main)"
+        required: false
+        default: ""
+      force:
+        description: "Rebuild even when the current commit is already published"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-images-v2
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: anywhere-labs/Agents-Anywhere
+  UPSTREAM_BRANCH: main
+  IMAGE_NAMESPACE: hraulein
+  IMAGE_NAME: agents-anywhere-v2
+  TAG_PREFIX: v2
+  KEEP_SHA_TAGS: "20"
+  KEEP_DATE_TAGS: "30"
+
+jobs:
+  resolve:
+    name: Resolve upstream commit
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      short: ${{ steps.resolve.outputs.short }}
+      date: ${{ steps.resolve.outputs.date }}
+      is_main: ${{ steps.resolve.outputs.is_main }}
+    steps:
+      - name: Resolve upstream ref to a commit
+        id: resolve
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          repo_url="https://github.com/${UPSTREAM_REPO}.git"
+          main_sha=$(git ls-remote "$repo_url" "refs/heads/${UPSTREAM_BRANCH}" | awk '{print $1}')
+
+          if [ -z "${REF:-}" ]; then
+            sha="$main_sha"
+          elif [[ "$REF" =~ ^[0-9a-f]{7,40}$ ]]; then
+            sha="$REF"
+          else
+            sha=$(git ls-remote "$repo_url" "$REF" "refs/heads/$REF" "refs/tags/$REF" | awk '{print $1}' | head -n1)
+          fi
+
+          if [ -z "$sha" ]; then
+            echo "could not resolve '${REF:-<empty>}' in ${UPSTREAM_REPO}" >&2
+            exit 1
+          fi
+
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short=${sha:0:12}" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          if [ "$sha" = "$main_sha" ]; then
+            echo "is_main=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_main=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "v2 build candidate: ${UPSTREAM_REPO}@${sha} (upstream ${UPSTREAM_BRANCH}: ${main_sha})"
+
+  decide:
+    name: Decide whether v2 changed
+    needs: resolve
+    runs-on: ubuntu-24.04
+    outputs:
+      mode: ${{ steps.decide.outputs.mode }}
+      base: ${{ steps.decide.outputs.base }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Compare with the newest published v2 build
+        id: decide
+        env:
+          SHA: ${{ needs.resolve.outputs.sha }}
+          SHORT: ${{ needs.resolve.outputs.short }}
+          FORCE: ${{ inputs.force }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          image="${IMAGE_NAMESPACE}/${IMAGE_NAME}"
+
+          echo "mode=build" >> "$GITHUB_OUTPUT"
+
+          if [ "$FORCE" = "true" ]; then
+            echo "force=true; building regardless"
+            exit 0
+          fi
+
+          # 1. This exact commit already published?
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://hub.docker.com/v2/repositories/${image}/tags/${TAG_PREFIX}-sha-${SHORT}")
+          if [ "$code" = "200" ]; then
+            echo "mode=skip" >> "$GITHUB_OUTPUT"
+            echo "${image}:${TAG_PREFIX}-sha-${SHORT} already exists; nothing to do."
+            exit 0
+          fi
+
+          # 2. Which commit produced the newest v2 image?
+          curl_args=()
+          if [ -n "${DOCKERHUB_USERNAME:-}" ] && [ -n "${DOCKERHUB_TOKEN:-}" ]; then
+            curl_args=(-u "${DOCKERHUB_USERNAME}:${DOCKERHUB_TOKEN}")
+          fi
+          list=$(curl -fsS "${curl_args[@]}" "https://hub.docker.com/v2/repositories/${image}/tags?page_size=100" || true)
+          base=$(printf '%s' "$list" | jq -r --arg p "${TAG_PREFIX}-sha-" \
+            '[.results[]? | select(.name | startswith($p))] | sort_by(.last_updated) | reverse | .[0].name // empty' \
+            | sed "s/^${TAG_PREFIX}-sha-//")
+          if [ -z "$base" ]; then
+            echo "no previous v2 image; building the first one"
+            exit 0
+          fi
+          echo "base=${base}" >> "$GITHUB_OUTPUT"
+          echo "newest v2 image was built from ${base}"
+
+          # 3. Did any v2 input change since then?
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
+          git fetch --no-tags upstream "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
+          if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            echo "base commit ${base} is not reachable from upstream ${UPSTREAM_BRANCH}; building"
+            exit 0
+          fi
+          changed=$(git diff --name-only "$base" "$SHA" -- server web-next docker/Dockerfile || true)
+          if [ -z "$changed" ]; then
+            echo "mode=skip" >> "$GITHUB_OUTPUT"
+            echo "no v2 input changed between ${base} and ${SHORT}; skipping"
+            exit 0
+          fi
+          echo "v2 inputs changed:"
+          printf '%s\n' "$changed"
+
+  build:
+    name: v2 image (amd64 + arm64)
+    needs: [resolve, decide]
+    if: needs.decide.outputs.mode == 'build'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Check out upstream commit
+        env:
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
+          if ! git fetch --depth 1 upstream "$SHA"; then
+            echo "shallow fetch by SHA failed, fetching full upstream history"
+            git fetch upstream "+refs/heads/*:refs/remotes/upstream/*" --tags
+          fi
+          git checkout --detach "$SHA"
+          git log -1 --format='%H %s'
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Compose the tag list
+        id: tags
+        run: |
+          set -euo pipefail
+          image="${IMAGE_NAMESPACE}/${IMAGE_NAME}"
+          {
+            echo "tags<<EOF"
+            echo "${image}:${TAG_PREFIX}-sha-${{ needs.resolve.outputs.short }}"
+            echo "${image}:${TAG_PREFIX}-date-${{ needs.resolve.outputs.date }}"
+            if [ "${{ needs.resolve.outputs.is_main }}" = "true" ]; then
+              echo "${image}:${TAG_PREFIX}-latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ env.UPSTREAM_REPO }}
+            org.opencontainers.image.revision=${{ needs.resolve.outputs.sha }}
+            org.opencontainers.image.version=${{ env.TAG_PREFIX }}-sha-${{ needs.resolve.outputs.short }}
+          cache-from: type=gha,scope=v2
+          cache-to: type=gha,mode=max,scope=v2
+          provenance: false
+
+      - name: Prune old tags
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          image="${IMAGE_NAMESPACE}/${IMAGE_NAME}"
+          auth="${DOCKERHUB_USERNAME}:${DOCKERHUB_TOKEN}"
+          list=$(curl -fsS -u "$auth" "https://hub.docker.com/v2/repositories/${image}/tags?page_size=100")
+
+          prune() {
+            local prefix="$1" keep="$2"
+            local stale
+            stale=$(printf '%s' "$list" | jq -r --arg p "${TAG_PREFIX}-${prefix}-" --argjson k "$keep" \
+              '[.results[] | select(.name | startswith($p))] | sort_by(.last_updated) | reverse | .[$k:] | .[].name')
+            for t in $stale; do
+              echo "prune ${image}:${t}"
+              curl -fsS -u "$auth" -X DELETE \
+                "https://hub.docker.com/v2/repositories/${image}/tags/${t}/" >/dev/null \
+                || echo "warn: could not delete ${t} (continuing)"
+            done
+          }
+
+          prune sha "${{ env.KEEP_SHA_TAGS }}"
+          prune date "${{ env.KEEP_DATE_TAGS }}"
+
+  notify:
+    name: Notify
+    needs: [resolve, decide, build]
+    # Only notify when a build actually ran: a "nothing v2 changed" day stays silent.
+    if: always() && needs.resolve.result == 'success' && needs.build.result != 'skipped'
+    runs-on: ubuntu-24.04
+    env:
+      GOTIFY_SERVER: ${{ secrets.GOTIFY_SERVER }}
+      GOTIFY_TOKEN: ${{ secrets.GOTIFY_TOKEN }}
+    steps:
+      - name: Send Gotify notification
+        if: env.GOTIFY_SERVER != '' && env.GOTIFY_TOKEN != ''
+        env:
+          RESULT: ${{ needs.build.result }}
+          SHORT: ${{ needs.resolve.outputs.short }}
+        run: |
+          set -euo pipefail
+          if [ "$RESULT" = "success" ]; then
+            title="AA v2 image: build ok (${SHORT})"
+            priority=3
+          else
+            title="AA v2 image: build ${RESULT} (${SHORT})"
+            priority=8
+          fi
+          body=$(printf 'result: %s\ncommit: %s\nimage: %s/%s:%s-sha-%s\nrun: %s/%s/actions/runs/%s' \
+            "$RESULT" "$SHORT" "${IMAGE_NAMESPACE}" "${IMAGE_NAME}" "${TAG_PREFIX}" "$SHORT" \
+            "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}")
+          curl -fsS -X POST "${GOTIFY_SERVER%/}/message?token=${GOTIFY_TOKEN}" \
+            -F "title=${title}" -F "message=${body}" -F "priority=${priority}" \
+            || echo "Gotify notification failed (continuing)"
