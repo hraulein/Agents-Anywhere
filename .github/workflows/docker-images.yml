@@ -87,7 +87,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: server
+          - name: control
             context: server-v3
             file: server-v3/Dockerfile
           - name: web
@@ -204,7 +204,7 @@ jobs:
             title="AA images: build ${RESULT} (${SHORT})"
             priority=8
           fi
-          body=$(printf 'result: %s\ncommit: %s\nimages: %s/agents-anywhere-{server,web,router}:sha-%s\nrun: %s/%s/actions/runs/%s' \
+          body=$(printf 'result: %s\ncommit: %s\nimages: %s/agents-anywhere-{control,web,router}:sha-%s\nrun: %s/%s/actions/runs/%s' \
             "$RESULT" "$SHORT" "${IMAGE_NAMESPACE}" "$SHORT" \
             "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}")
           curl -fsS -X POST "${GOTIFY_SERVER%/}/message?token=${GOTIFY_TOKEN}" \

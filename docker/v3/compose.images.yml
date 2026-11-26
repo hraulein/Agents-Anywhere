@@ -22,11 +22,11 @@ services:
 
   migrate:
     build: !reset null
-    image: ${AA_IMAGE_NAMESPACE:-hraulein}/agents-anywhere-server:${AA_IMAGE_TAG:-latest}
+    image: ${AA_IMAGE_NAMESPACE:-hraulein}/agents-anywhere-control:${AA_IMAGE_TAG:-latest}
 
   control:
     build: !reset null
-    image: ${AA_IMAGE_NAMESPACE:-hraulein}/agents-anywhere-server:${AA_IMAGE_TAG:-latest}
+    image: ${AA_IMAGE_NAMESPACE:-hraulein}/agents-anywhere-control:${AA_IMAGE_TAG:-latest}
 
   web:
     build: !reset null
@@ -34,4 +34,4 @@ services:
 
   s3-bucket:
     build: !reset null
-    image: ${AA_IMAGE_NAMESPACE:-hraulein}/agents-anywhere-server:${AA_IMAGE_TAG:-latest}
+    image: ${AA_IMAGE_NAMESPACE:-hraulein}/agents-anywhere-control:${AA_IMAGE_TAG:-latest}

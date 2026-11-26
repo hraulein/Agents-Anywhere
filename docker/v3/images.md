@@ -12,9 +12,11 @@
 
 | 镜像 | 来源 | 说明 |
 | --- | --- | --- |
-| `hraulein/agents-anywhere-server` | `server-v3/Dockerfile` | 控制面，`control`、`migrate`、`s3-bucket` 三个服务共用 |
+| `hraulein/agents-anywhere-control` | `server-v3/Dockerfile` | 控制面 `aa_control`，`control`、`migrate`、`s3-bucket` 三个服务共用 |
 | `hraulein/agents-anywhere-web` | `docker/v3/web.Dockerfile` | web-v3（Next.js standalone），`/api/control/*` 转发目标在构建时固定为 `http://control:8080` |
 | `hraulein/agents-anywhere-router` | `docker/v3/router.Dockerfile` | MeshCall Router，从 `meshcall-router-linux-{x64,arm64}@0.4.0` 取二进制 |
+
+早期版本发布过 `hraulein/agents-anywhere-server`，它和这里的 `-control` 内容相同（都来自 `server-v3/Dockerfile`）；改名后旧仓库不再更新，可以在 Docker Hub 上删掉。
 
 平台：`linux/amd64`、`linux/arm64`。Router 没有 `arm/v7` 二进制，所以不支持 32 位 ARM。
 
