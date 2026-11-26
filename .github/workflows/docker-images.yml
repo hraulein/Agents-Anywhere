@@ -1,0 +1,212 @@
+# Publish the AA v3 self-host images (control plane, web, MeshCall Router) to Docker Hub.
+#
+# The fork only carries this workflow and `docker/v3/compose.images.yml`; every build checks out the
+# *upstream* commit and leaves this fork's `main` alone. Images are rebuilt when upstream `main` moves
+# (or on demand), and a commit that is already published as `sha-<12>` is skipped.
+#
+# Required repository secrets: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN (read & write).
+# Optional: GOTIFY_SERVER, GOTIFY_TOKEN for build notifications.
+
+name: Docker Images
+
+on:
+  schedule:
+    # 03:17 Asia/Shanghai every day.
+    - cron: "17 19 * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Upstream ref or commit SHA to build (empty = upstream main)"
+        required: false
+        default: ""
+      force:
+        description: "Rebuild even when sha-<commit> is already on Docker Hub"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-images
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: anywhere-labs/Agents-Anywhere
+  UPSTREAM_BRANCH: main
+  IMAGE_NAMESPACE: hraulein
+
+jobs:
+  resolve:
+    name: Resolve upstream commit
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      short: ${{ steps.resolve.outputs.short }}
+      date: ${{ steps.resolve.outputs.date }}
+      is_main: ${{ steps.resolve.outputs.is_main }}
+    steps:
+      - name: Resolve upstream ref to a commit
+        id: resolve
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          repo_url="https://github.com/${UPSTREAM_REPO}.git"
+          main_sha=$(git ls-remote "$repo_url" "refs/heads/${UPSTREAM_BRANCH}" | awk '{print $1}')
+
+          if [ -z "${REF:-}" ]; then
+            sha="$main_sha"
+          elif [[ "$REF" =~ ^[0-9a-f]{7,40}$ ]]; then
+            sha="$REF"
+          else
+            sha=$(git ls-remote "$repo_url" "$REF" "refs/heads/$REF" "refs/tags/$REF" | awk '{print $1}' | head -n1)
+          fi
+
+          if [ -z "$sha" ]; then
+            echo "could not resolve '${REF:-<empty>}' in ${UPSTREAM_REPO}" >&2
+            exit 1
+          fi
+
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short=${sha:0:12}" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          if [ "$sha" = "$main_sha" ]; then
+            echo "is_main=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_main=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "building ${UPSTREAM_REPO}@${sha} (upstream ${UPSTREAM_BRANCH}: ${main_sha})"
+
+  build:
+    name: ${{ matrix.name }} (amd64 + arm64)
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: server
+            context: server-v3
+            file: server-v3/Dockerfile
+          - name: web
+            context: .
+            file: docker/v3/web.Dockerfile
+          - name: router
+            context: docker/v3
+            file: docker/v3/router.Dockerfile
+    steps:
+      - name: Is this commit already published?
+        id: published
+        run: |
+          set -euo pipefail
+          tag="sha-${{ needs.resolve.outputs.short }}"
+          image="${IMAGE_NAMESPACE}/agents-anywhere-${{ matrix.name }}"
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://hub.docker.com/v2/repositories/${image}/tags/${tag}")
+          if [ "$code" = "200" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "${image}:${tag} already exists; skipping."
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "${image}:${tag} not published yet (HTTP $code); building."
+          fi
+
+      - name: Checkout
+        if: steps.published.outputs.build == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Check out upstream commit
+        if: steps.published.outputs.build == 'true'
+        env:
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
+          if ! git fetch --depth 1 upstream "$SHA"; then
+            echo "shallow fetch by SHA failed, fetching full upstream history"
+            git fetch upstream "+refs/heads/*:refs/remotes/upstream/*" --tags
+          fi
+          git checkout --detach "$SHA"
+          git log -1 --format='%H %s'
+
+      - name: Set up QEMU
+        if: steps.published.outputs.build == 'true'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        if: steps.published.outputs.build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        if: steps.published.outputs.build == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Compose the tag list
+        id: tags
+        if: steps.published.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          image="${IMAGE_NAMESPACE}/agents-anywhere-${{ matrix.name }}"
+          {
+            echo "tags<<EOF"
+            echo "${image}:sha-${{ needs.resolve.outputs.short }}"
+            echo "${image}:date-${{ needs.resolve.outputs.date }}"
+            if [ "${{ needs.resolve.outputs.is_main }}" = "true" ]; then
+              echo "${image}:latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        if: steps.published.outputs.build == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ env.UPSTREAM_REPO }}
+            org.opencontainers.image.revision=${{ needs.resolve.outputs.sha }}
+            org.opencontainers.image.version=sha-${{ needs.resolve.outputs.short }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+          provenance: false
+
+  notify:
+    name: Notify
+    needs: [resolve, build]
+    if: always() && needs.resolve.result == 'success'
+    runs-on: ubuntu-24.04
+    env:
+      GOTIFY_SERVER: ${{ secrets.GOTIFY_SERVER }}
+      GOTIFY_TOKEN: ${{ secrets.GOTIFY_TOKEN }}
+    steps:
+      - name: Send Gotify notification
+        if: env.GOTIFY_SERVER != '' && env.GOTIFY_TOKEN != ''
+        env:
+          RESULT: ${{ needs.build.result }}
+          SHORT: ${{ needs.resolve.outputs.short }}
+        run: |
+          set -euo pipefail
+          if [ "$RESULT" = "success" ]; then
+            title="AA images: build ok (${SHORT})"
+            priority=3
+          else
+            title="AA images: build ${RESULT} (${SHORT})"
+            priority=8
+          fi
+          body=$(printf 'result: %s\ncommit: %s\nimages: %s/agents-anywhere-{server,web,router}:sha-%s\nrun: %s/%s/actions/runs/%s' \
+            "$RESULT" "$SHORT" "${IMAGE_NAMESPACE}" "$SHORT" \
+            "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}")
+          curl -fsS -X POST "${GOTIFY_SERVER%/}/message?token=${GOTIFY_TOKEN}" \
+            -F "title=${title}" -F "message=${body}" -F "priority=${priority}" \
+            || echo "Gotify notification failed (continuing)"
