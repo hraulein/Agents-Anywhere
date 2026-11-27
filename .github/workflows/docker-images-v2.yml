@@ -200,15 +200,12 @@ jobs:
         run: |
           set -euo pipefail
           image="${IMAGE_NAMESPACE}/${IMAGE_NAME}"
-          {
-            echo "tags<<EOF"
-            echo "${image}:sha-${{ needs.resolve.outputs.short }}"
-            echo "${image}:date-${{ needs.resolve.outputs.date }}"
-            if [ "${{ needs.resolve.outputs.is_main }}" = "true" ]; then
-              echo "${image}:latest"
-            fi
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+          tags="${image}:sha-${{ needs.resolve.outputs.short }},${image}:date-${{ needs.resolve.outputs.date }}"
+          if [ "${{ needs.resolve.outputs.is_main }}" = "true" ]; then
+            tags="${tags},${image}:latest"
+          fi
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+          echo "Tags: ${tags}"
 
       - name: Build and push
         uses: docker/build-push-action@v6
