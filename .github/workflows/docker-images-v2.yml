@@ -4,7 +4,7 @@
 # upstream commit, from this fork's default branch. The v3 services are published by
 # `docker-images-v3.yml`; this workflow only covers the legacy v2 bundle the DSH plugin still needs.
 #
-# Repository: `hraulein/agents-anywhere-v2` (separate from the three v3 repos).
+# Repository: `hraulein/agents-anywhere` (the v2 all-in-one bundle; v3 has its own three repositories).
 # Tag scheme: `latest`, `sha-<12>`, `date-<YYYYMMDD>` — the same scheme as the v3 images.
 #
 # A commit is rebuilt only when something v2 actually ships changed: `server/`, `web-next/` or
@@ -41,7 +41,7 @@ env:
   UPSTREAM_REPO: anywhere-labs/Agents-Anywhere
   UPSTREAM_BRANCH: main
   IMAGE_NAMESPACE: hraulein
-  IMAGE_NAME: agents-anywhere-v2
+  IMAGE_NAME: agents-anywhere
   KEEP_SHA_TAGS: "20"
   KEEP_DATE_TAGS: "30"
 
@@ -134,7 +134,7 @@ jobs:
           fi
           list=$(curl -fsS "${curl_args[@]}" "https://hub.docker.com/v2/repositories/${image}/tags?page_size=100" || true)
           base=$(printf '%s' "$list" | jq -r \
-            '[.results[]? | select(.name | startswith("sha-"))] | sort_by(.last_updated) | reverse | .[0].name // empty' \
+            '[.results[]? | select(.name | test("^sha-[0-9a-f]{7,40}$"))] | sort_by(.last_updated) | reverse | .[0].name // empty' \
             | sed 's/^sha-//')
           if [ -z "$base" ]; then
             echo "no previous v2 image; building the first one"
@@ -255,7 +255,7 @@ jobs:
   notify:
     name: Notify
     needs: [resolve, decide, build]
-    # Only notify when a build actually ran: a "nothing v2 changed" day stays silent.
+    # Notify only when a build actually ran; a "nothing v2 changed" day stays silent.
     if: always() && needs.resolve.result == 'success' && needs.build.result != 'skipped'
     runs-on: ubuntu-24.04
     env:
@@ -270,10 +270,10 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$RESULT" = "success" ]; then
-            title="AA v2 image: build ok (${SHORT})"
+            title="AA v2 image: ${SHORT} published"
             priority=3
           else
-            title="AA v2 image: build ${RESULT} (${SHORT})"
+            title="AA v2 image: ${RESULT} (${SHORT})"
             priority=8
           fi
           body=$(printf 'result: %s\ncommit: %s\nimage: %s/%s:sha-%s\nrun: %s/%s/actions/runs/%s' \

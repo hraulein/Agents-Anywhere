@@ -1,6 +1,6 @@
 # Agents Anywhere v2（一体化镜像：server + web-next 静态站）的最小 Compose。
 #
-# 镜像：hraulein/agents-anywhere-v2:latest（由 fork 的 "Docker Images v2" 工作流发布）
+# 镜像：hraulein/agents-anywhere:latest（由 fork 的 "Docker Images v2" 工作流发布）
 # 端口：容器内 8000，宿主机默认 5175（V2_PORT）
 # 数据：./agents-anywhere-v2/{postgres,redis,files}
 #
@@ -65,7 +65,7 @@ services:
 
   # 一次性迁移：与 server 同一个镜像，跑完退出（Exited 0 正常）。
   v2-migrate:
-    image: hraulein/agents-anywhere-v2:${V2_IMAGE_TAG:-latest}
+    image: hraulein/agents-anywhere:${V2_IMAGE_TAG:-latest}
     restart: "no"
     depends_on:
       v2-postgres:
@@ -74,7 +74,7 @@ services:
     command: ["sh", "-c", "cd /app/server && uv run --no-sync python -m agent_server.infra.db.migrations upgrade"]
 
   v2-server:
-    image: hraulein/agents-anywhere-v2:${V2_IMAGE_TAG:-latest}
+    image: hraulein/agents-anywhere:${V2_IMAGE_TAG:-latest}
     restart: unless-stopped
     depends_on:
       v2-migrate:

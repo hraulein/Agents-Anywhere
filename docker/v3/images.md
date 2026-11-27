@@ -21,7 +21,7 @@
 
 | 镜像 | 来源 | 说明 |
 | --- | --- | --- |
-| `hraulein/agents-anywhere-v2` | `docker/Dockerfile` | v2 一体化镜像：`server/`（FastAPI）+ 构建后的 `web-next/` 静态站，监听 8000，数据卷 `/data`；compose 模板见 [`docker/v2/compose.yml`](../v2/compose.yml) |
+| `hraulein/agents-anywhere` | `docker/Dockerfile` | v2 一体化镜像：`server/`（FastAPI）+ 构建后的 `web-next/` 静态站，监听 8000，数据卷 `/data`；compose 模板见 [`docker/v2/compose.yml`](../v2/compose.yml) |
 
 v2 与 v3 用**不同仓库**区分，tag 规则完全一致（见下文），不用前缀也能分清。DSH 插件目前仍只支持 v2，
 所以两者要同时存在。v2 工作流只在 `server/`、`web-next/` 或 `docker/Dockerfile` 相对上一个 v2 构建有变化时才
